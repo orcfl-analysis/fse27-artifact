@@ -1,0 +1,142 @@
+#!/bin/bash
+# GraCFL baseline re-runs on the released Graspan graphs, on OUR
+# machine (same-machine rule): the engine-comparison rows behind
+# the Q1 story. Two configurations per graph, mirroring GraCFL's
+# own Table-5 presentation:
+#   bi-1t   serial,  traversal=bi, 1 thread   (their "(BI, 1t)")
+#   fw-32t  parallel, traversal=fw, N threads (their "(FW, 32t)")
+# Threads default 32 to match their published setting; override
+# with KA_GRACFL_THREADS. Pin with KA_CPUSET sized to the thread
+# count. GraCFL's own stdout (results/banners) is captured per run.
+#
+# Grammar: KA_GRACFL_GRAMMAR if set (use Graspan's original rules
+# file from their Drive folder for exact reproduction); otherwise
+# our DefaultP2Grammar is emitted — same language and alphabet
+# (a/-a/d/-d), our normalization — and the summary marks it.
+#
+# Sources (fetched and verified; nothing machine-specific):
+#   GraCFL   upstream AutomataLab/GraCFL at a pinned commit, plus
+#            eval/gracfl/fork.patch (edge-list graph construction,
+#            grammar-id dump, and a SIGFPE fix in the BW solvers)
+#   graphs   the Graspan benchmark graphs from GraCFL's own Drive folder
+#            (README of GraCFL), sha256-pinned; KA_GRACFL_GRAMMAR=graspan
+#            uses the Graspan points-to grammar from the same folder
+# Usage:
+#   eval/63-gracfl-graspan.sh [graph-file ...]
+# Default graphs: linux kernel_afterInline (their "linux PT" row),
+# postgres wholegraph, httpd wholegraph.
+
+set -u
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib-fetch.sh"
+KA_GRASPAN_DIR="${KA_GRASPAN_DIR:-$KA_WORK/graspan}"
+KA_GRACFL_SRC="${KA_GRACFL_SRC:-$KA_WORK/src/GraCFL}"
+GRACFL_URL=https://github.com/AutomataLab/GraCFL.git
+GRACFL_BASE=e36e0bf4bb297365110d962600097847d9dd1d2f
+# path under KA_GRASPAN_DIR | Drive id (GraCFL README folder) | sha256
+GRASPAN_FILES="linux-4-4-p2/kernel_afterInline.txt|1KIIIq59iDh7qd5HRV06uNiKrQNm_2GuN|2eb55acb151508c8e9495815c06c5ee850a9fa7e6364fa878f6e7e33bf15a601
+postgresql-8.3.9-p2/wholegraph/PostgreSQL_8.3.9_pointsto_graph|1a1sh6o-njQUj7S_pClMhWxTDgzzPLmmQ|2dc06408d70aab7823c820157b7b8bfed7803719df243440c7613daa7525a973
+httpd-2.2.18-p2/Apache_httpd_2.2.18_pointsto_graph|1VAnCSJOM0Kcql3ZyISOVp_tIYlh4xIe9|8e478ea0c65bc119295a27970bf43e2a889b8f9f555721ec71d45bd827be4122
+linux-4.4-df/lnx_kernel_df|128zIrPyMSDmKELEtiyOP7J3GCgclvnyW|cae6b50538a30151f15e4c7021d796e6b87a1ea766744fb3028e08486abbd4a3
+grammars/rules_pointsto.txt|1ws1XU8rU1ffnF3SVqrN1IyuvXuZYRtJH|c4e5cf64820ded75e3fb5c37315c2b406d06449b6f2b9fe36d94c81d7f8ab26f"
+if [[ "${KA_GRASPAN_FETCH:-1}" == 1 ]]; then
+  while IFS='|' read -r rel id sha; do
+    fetch_gdrive "$id" "$KA_GRASPAN_DIR/$rel" "$sha" || exit 1
+  done <<< "$GRASPAN_FILES"
+fi
+KA_GRACFL_THREADS="${KA_GRACFL_THREADS:-32}"
+OUT="${KA_GRACFL_OUT:-$KA_RESULTS/gracfl-graspan}"
+mkdir -p "$OUT"
+export LC_ALL=C
+PIN=()
+[[ -n "${KA_CPUSET:-}" ]] && PIN=(taskset -c "$KA_CPUSET")
+
+# --- build upstream GraCFL once ---
+BIN="$KA_GRACFL_SRC/build/bin/gracfl"
+if [[ ! -x "$BIN" ]]; then
+  if [[ ! -d "$KA_GRACFL_SRC/.git" || "$KA_GRACFL_SRC" == "$KA_WORK/src/GraCFL" ]]; then
+    clone_at "$GRACFL_URL" "$KA_GRACFL_SRC" "$GRACFL_BASE" || exit 1
+    git -C "$KA_GRACFL_SRC" apply --check "$KA_REPO/eval/gracfl/fork.patch" 2>/dev/null \
+      && git -C "$KA_GRACFL_SRC" apply "$KA_REPO/eval/gracfl/fork.patch"
+  fi
+  echo "== building GraCFL ($KA_GRACFL_SRC)"
+  cmake -S "$KA_GRACFL_SRC" -B "$KA_GRACFL_SRC/build" \
+        -DCMAKE_BUILD_TYPE=Release > "$OUT/build.log" 2>&1 \
+    && cmake --build "$KA_GRACFL_SRC/build" -j "$KA_JOBS" \
+         >> "$OUT/build.log" 2>&1
+  [[ -x "$BIN" ]] || { echo "!! GraCFL build failed — $OUT/build.log" >&2
+                       tail -15 "$OUT/build.log" >&2; exit 1; }
+fi
+
+# --- grammar ---
+GRAMMAR="${KA_GRACFL_GRAMMAR:-}"
+[[ "$GRAMMAR" == graspan ]] && GRAMMAR="$KA_GRASPAN_DIR/grammars/rules_pointsto.txt"
+GRAMMAR_NOTE="graspan-original"
+if [[ -z "$GRAMMAR" ]]; then
+  GRAMMAR="$OUT/p2-grammar.txt"
+  GRAMMAR_NOTE="our-normalization"
+  awk '/DefaultP2Grammar = \{/,/^\};/' "$KA_REPO/src/lib/Global.h" \
+    | grep -oE '"[^"]+"' | tr -d '"' > "$GRAMMAR"
+  [[ -s "$GRAMMAR" ]] || { echo "!! grammar extraction failed" >&2; exit 1; }
+  echo "== grammar: $GRAMMAR ($GRAMMAR_NOTE, $(wc -l < "$GRAMMAR") rules)"
+fi
+
+run_one() {
+  local graph="$1" mode="$2"   # mode: bi-1t | fw-Nt
+  local name; name=$(basename "$graph" | tr '.' '_')
+  local tag="$name.$mode"
+  local log="$OUT/$tag.log" tlog="$OUT/$tag.time"
+  if [[ -s "$tlog" && "${KA_FORCE:-0}" != 1 ]]; then
+    echo "== $tag: done, skipping"; return 0
+  fi
+  local cfg="$(dirname "$BIN")/ConfigGraCFL"
+  case "$mode" in
+    bi-1t)
+      printf 'graphFilepath = %s\ngrammarFilepath = %s\nexecutionMode = serial\ntraversalDirection = bi\nprocessingStrategy = gram-driven\n' \
+        "$graph" "$GRAMMAR" > "$cfg" ;;
+    fw-*)
+      printf 'graphFilepath = %s\ngrammarFilepath = %s\nexecutionMode = parallel\ntraversalDirection = fw\nprocessingStrategy = gram-driven\nnumThreads = %s\n' \
+        "$graph" "$GRAMMAR" "$KA_GRACFL_THREADS" > "$cfg" ;;
+  esac
+  echo "== $tag: running ($(date -Is))"
+  # The binary prints its self-measured solve time ("Total Time")
+  # BEFORE dumping the full closure to stdout (15 GB / 900M lines at
+  # httpd scale). Filter: keep non-edge lines, count edge triples —
+  # no giant log, no disk I/O in the number that matters. The
+  # citable time is the self-reported one (solve only); time -v
+  # wall includes the dump-formatting and is NOT citable.
+  ( cd "$(dirname "$BIN")" && \
+    /usr/bin/time -v -o "$tlog" "${PIN[@]}" ./gracfl 2>&1 \
+      | awk '/^[0-9]+ [0-9]+ [0-9]+$/ {n++; next} {print} \
+             END {print "ResultEdges = " n}' > "$log" )
+  local rc=${PIPESTATUS[0]:-0}
+  [[ $rc -ne 0 ]] && echo "!! $tag exited $rc — see $log" >&2
+  return 0
+}
+
+GRAPHS=("$@")
+if [[ ${#GRAPHS[@]} -eq 0 ]]; then
+  GRAPHS=(
+    "$KA_GRASPAN_DIR/linux-4-4-p2/kernel_afterInline.txt"
+    "$KA_GRASPAN_DIR/postgresql-8.3.9-p2/wholegraph/PostgreSQL_8.3.9_pointsto_graph"
+    "$KA_GRASPAN_DIR/httpd-2.2.18-p2/Apache_httpd_2.2.18_pointsto_graph"
+  )
+fi
+
+for g in "${GRAPHS[@]}"; do
+  [[ -s "$g" ]] || { echo "!! missing graph: $g" >&2; continue; }
+  run_one "$g" bi-1t
+  run_one "$g" "fw-${KA_GRACFL_THREADS}t"
+done
+
+echo -e "graph\tmode\tgrammar\tsolve_s\tresult_edges\tmaxrss_kb" | tee "$OUT/summary.tsv"
+for t in "$OUT"/*.time; do
+  [[ -s "$t" ]] || continue
+  tag=$(basename "$t" .time)
+  lg="$OUT/$tag.log"
+  solve=$(grep -oE 'Total Time[^0-9]*[0-9.]+' "$lg" 2>/dev/null | grep -oE '[0-9.]+' | tail -1)
+  edges=$(grep -oE 'ResultEdges = [0-9]+' "$lg" 2>/dev/null | grep -oE '[0-9]+')
+  rss=$(grep -oE 'Maximum resident set size.*[0-9]+' "$t" | grep -oE '[0-9]+$')
+  echo -e "${tag%.*}\t${tag##*.}\t$GRAMMAR_NOTE\t${solve:--}\t${edges:--}\t$rss" | tee -a "$OUT/summary.tsv"
+done

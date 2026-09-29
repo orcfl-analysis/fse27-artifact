@@ -1,0 +1,76 @@
+#ifndef _COMMON_H
+#define _COMMON_H
+
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/Format.h>
+#include <llvm/Config/llvm-config.h>
+#include "Flags.h"
+
+#include <unistd.h>
+#include <bitset>
+#include <chrono>
+
+// LLVM 18+ deprecated startswith in favor of starts_with
+// This macro provides compatibility across LLVM versions
+#if LLVM_VERSION_MAJOR >= 18
+  #define LLVM_STRING_STARTS_WITH(str, prefix) (str).starts_with(prefix)
+  #define LLVM_STRING_ENDS_WITH(str, suffix) (str).ends_with(suffix)
+#else
+  #define LLVM_STRING_STARTS_WITH(str, prefix) (str).startswith(prefix)
+  #define LLVM_STRING_ENDS_WITH(str, suffix) (str).endswith(suffix)
+#endif
+
+// Elapsed seconds since the first KA_LOG (~process start). Anchor is a
+// function-local static: thread-safe init, no .cc file needed.
+inline double kaElapsedSec() {
+	static const auto anchor = std::chrono::steady_clock::now();
+	return std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - anchor).count();
+}
+
+#define KA_LOG(lv, stmt)							\
+	do {											\
+		if (VerboseLevel >= lv) {					\
+			if (LogTimestamps)						\
+				llvm::errs() << llvm::format("[+%.1fs] ", kaElapsedSec()); \
+			llvm::errs() << stmt;					\
+		}										\
+	} while(0)
+
+
+#define RES_REPORT(stmt) KA_LOG(0, stmt);
+#define WARNING(stmt) KA_LOG(1, "\n[WARN] " << stmt);
+#define TEST_REPORT(stmt) KA_LOG(3, "[TEST] " << stmt);
+
+#define KA_ERR(stmt)															\
+	do {																		\
+		llvm::errs() << "ERROR (" << __FUNCTION__ << "@" << __LINE__ << ")";	\
+		llvm::errs() << ": " << stmt;											\
+		exit(-1);																\
+    } while(0)
+
+class Timer {
+public:
+	Timer(StringRef name) : name(name), begin(now()) {
+	}
+
+	~Timer() {
+		auto end = now();
+		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
+		errs() << "Timer on " << name << " : " << duration << " milliseconds" << "\n";
+	}
+private:
+	std::chrono::high_resolution_clock::time_point now() {
+		return std::chrono::high_resolution_clock::now();
+	}
+	StringRef name;
+	std::chrono::high_resolution_clock::time_point begin;
+};
+
+// #define FUNCTION_TIMER() Timer _t_func = Timer(__FUNCTION__)
+// #define NAMED_TIMER(name) Timer _t_named = Timer(name)
+
+#define FUNCTION_TIMER()
+#define NAMED_TIMER(name)
+
+#endif

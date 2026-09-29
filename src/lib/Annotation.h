@@ -1,0 +1,223 @@
+#ifndef _ANNOTATION_H
+#define _ANNOTATION_H
+
+#pragma once
+
+#include <llvm/IR/Value.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Type.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Metadata.h>
+#include <llvm/ADT/Hashing.h>
+#include <llvm/Support/Path.h>
+#include <string>
+#include <llvm/Support/Debug.h>
+
+#include "Common.h"
+
+#define MD_TaintSrc   "taint_src"
+#define MD_Taint      "taint"
+#define MD_Sink       "sink"
+#define MD_ID         "id"
+#define MD_TBAA       "tbaa"
+
+#define MD_NAME_INFO_OP 0
+#define MD_ARG_INFO_OP 1
+
+inline llvm::StringRef getStringFromMD(llvm::MDNode *MD, unsigned index=MD_NAME_INFO_OP) {
+  if (llvm::MDString *S = llvm::dyn_cast_or_null<llvm::MDString>(MD->getOperand(index)))
+    return S->getString();
+  return "";
+}
+
+static inline bool isFunctionPointer(llvm::Type *Ty) {
+  //llvm::PointerType *PTy = llvm::dyn_cast<llvm::PointerType>(Ty);
+  //return PTy && PTy->getElementType()->isFunctionTy();
+  return true;
+}
+
+// static inline bool isFunctionPointerOrVoid(llvm::Type *Ty) {
+//   llvm::PointerType *PTy = llvm::dyn_cast<llvm::PointerType>(Ty);
+//   if (!PTy)
+//     return false;
+
+//   llvm::Type *subTy = PTy->getElementType();
+//   if (subTy->isFunctionTy())
+//     return true;
+
+//   // FIXME should add something in clang to indicate real void*
+//   // like in CPI
+//   if (subTy->isIntegerTy(8))
+//     return true;
+
+//   return false;
+// }
+
+static inline std::string getScopeName(const llvm::GlobalValue *GV) {
+  if (llvm::GlobalValue::isExternalLinkage(GV->getLinkage()))
+    return GV->getName().str();
+  else {
+    // Keep scoped names human-readable but collision-resistant across modules
+    // with the same basename by appending a stable hash of module identifier.
+    llvm::StringRef moduleId = GV->getParent()->getModuleIdentifier();
+    llvm::StringRef moduleStem = llvm::sys::path::stem(moduleId);
+    uint64_t moduleHash = static_cast<uint64_t>(llvm::hash_value(moduleId));
+    return "_" + moduleStem.str() + "." + std::to_string(moduleHash) + "." +
+           GV->getName().str();
+  }
+}
+
+static inline std::string getScopeName(const llvm::Instruction *I) {
+  const llvm::Function *F = I->getParent()->getParent();
+  assert(F && "Cannot get Function");
+  llvm::StringRef moduleId = F->getParent()->getModuleIdentifier();
+  llvm::StringRef moduleStem = llvm::sys::path::stem(moduleId);
+  uint64_t moduleHash = static_cast<uint64_t>(llvm::hash_value(moduleId));
+  if (I->hasName())
+    return "_" + moduleStem.str() + "." + std::to_string(moduleHash) + "." +
+           F->getName().str() + "." + I->getName().str();
+
+  return "_" + moduleStem.str() + "." + std::to_string(moduleHash) + "." +
+         F->getName().str() + ".anonymous";
+}
+
+// prefix anonymous struct name with module name
+static inline std::string getScopeName(const llvm::StructType *Ty, const llvm::Module *M) {
+  if (Ty->isLiteral())
+    return "";
+  llvm::StringRef structName = Ty->getStructName();
+  size_t dotPos = structName.rfind('.');
+  if (M && (LLVM_STRING_STARTS_WITH(structName, "struct.anon") ||
+    LLVM_STRING_STARTS_WITH(structName, "union.anon"))) {
+    llvm::StringRef rest = structName.substr(6);
+    llvm::StringRef moduleId = M->getModuleIdentifier();
+    llvm::StringRef moduleStem = llvm::sys::path::stem(moduleId);
+    uint64_t moduleHash = static_cast<uint64_t>(llvm::hash_value(moduleId));
+    return "struct._" + moduleStem.str() + "." + std::to_string(moduleHash) + rest.str();
+  }
+  if (dotPos != 0 && dotPos != llvm::StringRef::npos &&
+    structName.back() != '.' &&
+    isdigit(static_cast<unsigned char>(structName[dotPos + 1])))
+    structName = structName.substr(0, dotPos);
+  return structName.str();
+}
+
+static inline llvm::StringRef getLoadStoreId(const llvm::Instruction *I) {
+  if (llvm::MDNode *MD = I->getMetadata(MD_ID))
+    return getStringFromMD(MD);
+  return llvm::StringRef();
+}
+
+static inline std::string
+getStructId(llvm::StructType *STy, llvm::Module *M, unsigned offset) {
+  if (!STy || STy->isLiteral())
+    return "";
+  return getScopeName(STy, M) + "," + std::to_string(offset);
+}
+
+static inline std::string getStructId(llvm::Type *Ty, llvm::Module *M) {
+  if (Ty->isPointerTy()) {
+    Ty = Ty->getContainedType(0);
+    if (llvm::StructType *STy = llvm::dyn_cast<llvm::StructType>(Ty))
+      return getScopeName(STy, M);
+  }
+  return "";
+}
+
+static inline std::string getVarId(const llvm::GlobalValue *GV) {
+  return "var." + getScopeName(GV);
+}
+
+static inline std::string getVarId(llvm::AllocaInst *AI) {
+  return "lvar." + getScopeName(AI);
+}
+
+static inline std::string getArgId(llvm::Function *F, unsigned no) {
+  return "arg." + getScopeName(F) + "." + std::to_string(no);
+}
+
+static inline std::string getArgId(llvm::Argument *A) {
+  return getArgId(A->getParent(), A->getArgNo());
+}
+
+static inline std::string getRetId(llvm::Function *F) {
+  return "ret." + getScopeName(F);
+}
+
+static inline std::string getValueId(llvm::Value *V);
+static inline std::string getRetId(llvm::CallInst *CI) {
+  if (llvm::Function *CF = CI->getCalledFunction())
+    return getRetId(CF);
+  else {
+    std::string sID = getValueId(CI->getCalledOperand());
+    if (sID != "")
+      return "ret." + sID;
+  }
+  return "";
+}
+
+static inline std::string getValueId(llvm::Value *V) {
+  if (llvm::Argument *A = llvm::dyn_cast<llvm::Argument>(V))
+    return getArgId(A);
+  else if (llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(V)) {
+    if (llvm::Function *F = CI->getCalledFunction())
+      if (LLVM_STRING_STARTS_WITH(F->getName(), "kint_arg.i"))
+        return getLoadStoreId(CI).str();
+    return getRetId(CI);
+  } else if (llvm::isa<llvm::LoadInst>(V) || llvm::isa<llvm::StoreInst>(V)) {
+    return getLoadStoreId(llvm::dyn_cast<llvm::Instruction>(V)).str();
+  } else if (llvm::isa<llvm::AllocaInst>(V)) {
+    return getVarId(llvm::dyn_cast<llvm::AllocaInst>(V));
+  } else if (llvm::Instruction *I = llvm::dyn_cast<llvm::Instruction>(V)) {
+    return "unknown." + getScopeName(I);
+  }
+
+  WARNING("No Value Id for : " << *V << "\n");
+
+  return "";
+}
+
+// Returns true for LLVM intrinsics that represent meaningful function calls
+// worth tracking in the call graph (memory operations that map to real libc
+// functions and matter for data-flow / taint / vulnerability analysis).
+static inline bool isImportantIntrinsic(const llvm::Function *F) {
+  if (!F->isIntrinsic())
+    return false;
+  switch (F->getIntrinsicID()) {
+  case llvm::Intrinsic::memcpy:
+  case llvm::Intrinsic::memcpy_inline:
+  case llvm::Intrinsic::memmove:
+  case llvm::Intrinsic::memset:
+#if LLVM_VERSION_MAJOR >= 15
+  case llvm::Intrinsic::memset_inline:
+#endif
+    return true;
+  default:
+    return false;
+  }
+}
+
+extern bool isAllocFn(llvm::StringRef name, int *size, int *flag);
+static inline bool isAllocFn(llvm::StringRef name) {
+  int size, flag;
+  return isAllocFn(name, &size, &flag);
+}
+
+extern bool isFreeFn(llvm::StringRef name);
+
+extern bool isEntryFn(llvm::StringRef name);
+extern bool isExitFn(llvm::StringRef name);
+extern bool isPrintFn(llvm::StringRef name);
+extern bool isKernelUtilityFn(llvm::StringRef name);
+extern bool isCompilerIntroducedValue(const llvm::Value *V);
+
+extern std::string getAnnotation(llvm::Value *V, llvm::Module *M);
+extern std::string getLoadId(llvm::LoadInst *LI);
+extern std::string getStoreId(llvm::StoreInst *SI);
+extern std::string getAnonStructId(llvm::Value *V, llvm::Module *M, llvm::StringRef Prefix);
+extern std::string getStructId(llvm::Value *PV, llvm::User::op_iterator &IS, llvm::User::op_iterator &IE,
+                               llvm::Module *M);
+extern uint32_t getBasicBlockId(const llvm::BasicBlock *BB);
+
+#endif

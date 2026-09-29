@@ -1,0 +1,1428 @@
+# Transfer summaries (--func-summaries): callsite-applied atoms.
+# Line: <name>[*] ATOM [ATOM...]    '*' suffix = prefix match.
+# Ordered, FIRST MATCH WINS (NONE lines carve exclusions out of a
+# following prefix rule). Atoms:
+#   FRESH            per-callsite heap object (drives AllocFuncs paths)
+#   CPY(ret<-argN)   shift-preserving cell copy into the result
+#   ALIAS(ret=argN)  result aliases the argument value
+#   ST(*argC<-argV)  store value argV into *argC
+#   LD(ret<-*argC)   result loaded from *argC
+#   NONE             explicitly no summary (body analyzed)
+#   NOOP             no transfer at the callsite AND body skipped
+#                    (standalone; replaces hardcoded free/utility lists)
+#
+# Provenance: migrated 2026-07-24 from the hardcoded isAllocFn table
+# (src/lib/Annotation.cc) — task #26 — plus the dup family with copy
+# semantics (CPY), fixing the measured copy-loss (t_kmemdup.c was 0/2:
+# kmemdup sat in isAllocFn, its body was skipped, the memcpy dropped)
+# and suppressing the shared allocator return-node channel (~470
+# witnessed cross-caller joins at km).
+#
+# ASSUMPTIONS (recorded):
+# - CPY models aligned whole-buffer dup from offset 0; prefix copies
+#   over-approximate soundly.
+# - *_user dup/copy sources are userspace memory: kernel fptrs must
+#   never round-trip through user memory (same assumption as uaccess
+#   asm), so those get FRESH without CPY.
+
+# ---- userspace ----
+malloc FRESH
+calloc FRESH
+_Znwj FRESH
+_ZnwjRKSt9nothrow_t FRESH
+_Znwm FRESH
+_ZnwmRKSt9nothrow_t FRESH
+_Znaj FRESH
+_ZnajRKSt9nothrow_t FRESH
+_Znam FRESH
+_ZnamRKSt9nothrow_t FRESH
+realloc FRESH CPY(ret<-arg0)
+# strdup/strndup copy CHARACTERS: a C string holds no pointer, so the
+# residue-complete CPY only relays content that reached the source
+# string through an unknown-offset fold (cflow: a wordsplit field store
+# copied by strdup into a string, then into the scanner buffer). FRESH only.
+strdup FRESH
+strndup FRESH
+
+# ---- gnulib / libiberty xalloc family (2026-09-16) ----
+# Same semantics as the libc functions they wrap, plus abort on
+# failure. Without these the wrapper's body is analyzed once and its
+# single return node unions every caller's argument (cflow: token_stack
+# received pp_finalize's obstack buffer through xrealloc).
+xmalloc FRESH
+xzalloc FRESH
+xcalloc FRESH
+xcharalloc FRESH
+xnmalloc FRESH
+xrealloc FRESH CPY(ret<-arg0)
+xreallocarray FRESH CPY(ret<-arg0)
+xnrealloc FRESH CPY(ret<-arg0)
+x2realloc FRESH CPY(ret<-arg0)
+x2nrealloc FRESH CPY(ret<-arg0)
+xstrdup FRESH
+xstrndup FRESH
+xmemdup FRESH CPY(ret<-arg0)
+
+# ---- gnulib hash / cflow linked list: instance channels (2026-09-16) ----
+# Container APIs summarized so their bodies (unknown-index bucket walks,
+# list traversals) stop pooling every instance's payload. The dispatch
+# sites inside the bodies keep their identity through DISPATCH atoms
+# (the SoK ground truth keys hash.c:253/272/383/805/833 and
+# linked-list.c:87/111/128 by those sites). Layout (x86-64):
+#   struct hash_table: hasher@48 comparator@56 data_freer@64; the payload
+#   slot is synthetic @80 (past the 80-byte struct).
+#   struct linked_list: free_data@0 head@8 tail@16; entries are modelled
+#   AS the list object, payload slot synthetic @24; an entry pointer is
+#   the list pointer (append returns it, unlink takes it).
+# hash_initialize is NOT summarized: its body substitutes raw_hasher /
+# raw_comparator when the caller passes NULL, and a FRESH entry would
+# drop that path (sound only for callers that pass real functions).
+hash_insert ST(*arg0@80<-arg1) ALIAS(ret=arg1) DISPATCH(*arg0@48:f0<-arg1@safe_hasher) DISPATCH(*arg0@56:f0<-arg1@hash_find_entry) DISPATCH(*arg0@56:f1<-*arg0@80@hash_find_entry)
+hash_lookup LD(ret<-*arg0@80) DISPATCH(*arg0@48:f0<-arg1@safe_hasher) DISPATCH(*arg0@56:f0<-arg1@hash_lookup) DISPATCH(*arg0@56:f1<-*arg0@80@hash_lookup)
+hash_do_for_each DISPATCH(arg1:f0<-*arg0@80) DISPATCH(arg1:f1<-arg2)
+hash_free DISPATCH(*arg0@64:f0<-*arg0@80)
+hash_get_first LD(ret<-*arg0@80)
+hash_get_next LD(ret<-*arg0@80)
+linked_list_create FRESH ST(*ret@0<-arg0)
+linked_list_append FRESHSUB(*arg0) ST2(**arg0@24<-arg1) LD(ret<-*arg0)
+linked_list_prepend FRESHSUB(*arg0) ST2(**arg0@24<-arg1) LD(ret<-*arg0)
+linked_list_iterate DISPATCH(arg1:f0<-**arg0@24) DISPATCH(arg1:f1<-arg2)
+linked_list_destroy DISPATCH(**arg0@0:f0<-**arg0@24)
+linked_list_unlink DISPATCH(*arg0@0:f0<-*arg1@24)
+
+# ---- libc callback interfaces (2026-09-16, from the man pages) ----
+# The registration pairs of userspace: the callback's data-carrying
+# formals are bound at the registration site (INVOKE), which also
+# re-attributes the call-graph edge there (the site inside libc is not
+# in the module). argD@X = the callback receives an INTERIOR pointer
+# into the data argument (an element of the array). Formals that
+# receive libc-internal objects (dirent, FTSENT, stat, tree nodes) are
+# left unbound; tsearch/twalk/hsearch/scandir/nftw/glob have no entry.
+qsort INVOKE(arg3:f0<-arg0@X) INVOKE(arg3:f1<-arg0@X)
+qsort_r INVOKE(arg3:f0<-arg0@X) INVOKE(arg3:f1<-arg0@X) INVOKE(arg3:f2<-arg4)
+bsearch INVOKE(arg4:f0<-arg0) INVOKE(arg4:f1<-arg1@X) ALIAS(ret<-arg1@X)
+lfind INVOKE(arg4:f0<-arg0) INVOKE(arg4:f1<-arg1@X) ALIAS(ret<-arg1@X)
+pthread_create INVOKE(arg2:f0<-arg3)
+pthread_atfork INVOKE(arg0:ret) INVOKE(arg1:ret) INVOKE(arg2:ret)
+
+# ---- libc interface, DERIVED from musl 1.2.6 (2026-09-16) ----
+# Harvested from one run of the wrapper confirmer and the NOOP/solved
+# proposers over musl built as bitcode (scratchpad/musl-run.sh):
+# NOOP = proven transfer-free body (no pointer effect at any callsite),
+# atom lines = the solved transfer summary (proposals that referenced
+# a musl-internal global are left out: a partial line would claim
+# completeness it does not have). Names already in this file above
+# keep their hand-written entry (first match wins). The transfer
+# semantics are those of the C standard, which glibc shares.
+getutxent FRESH
+getutxid FRESH
+getutxline FRESH
+pututxline FRESH
+getspent FRESH
+getservent FRESH
+getnetbyaddr FRESH
+getnetbyname FRESH
+gethostent FRESH
+getnetent FRESH
+wctrans FRESH
+rule_to_secs LD(ret<-*arg0@X)
+zi_dotprod LD(ret<-*arg1@X)
+getint MVX(*arg0<-*arg0)
+pthread_rwlock_init MV(*arg0@8<-*arg1)
+pthread_mutexattr_setrobust MV(*arg0<-*arg0)
+pthread_mutexattr_setprotocol MV(*arg0<-*arg0)
+pthread_mutex_init MV(*arg0<-*arg1)
+pthread_barrier_init MV(*arg0@X<-*arg1)
+pthread_attr_setstacksize ST(*arg0<-arg1)
+pthread_attr_setstack ST(*arg0<-arg2) ST(*arg0@16<-arg1@X) ST(*arg0@16<-arg2@X)
+pthread_attr_getguardsize MV(*arg1<-*arg0@8)
+pthread_attr_getstack MV(*arg1<-*arg0) MV(*arg1<-*arg0@16) MV(*arg1<-*arg2) MV(*arg2<-*arg0)
+pthread_attr_getstacksize MV(*arg1<-*arg0)
+pthread_attr_setguardsize ST(*arg0@8<-arg1)
+wmemset ALIAS(ret<-arg0@X)
+wmemmove ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wmemcpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wmemchr ALIAS(ret<-arg0@X)
+wcsnlen ALIAS(ret<-arg0@X) ALIAS(ret<-arg1)
+wcsncpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wcslen ALIAS(ret<-arg0@X)
+wcschr ALIAS(ret<-arg0@X)
+wcscpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wcscat ALIAS(ret<-arg0) MV(*arg0@X<-*arg1@X)
+wcpcpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wcpncpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+twobyte_strstr ALIAS(ret<-arg0@X)
+threebyte_strstr ALIAS(ret<-arg0@X)
+fourbyte_strstr ALIAS(ret<-arg0@X)
+strspn ALIAS(ret<-arg0@X)
+strtok_r ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) LD(ret<-*arg2) LDX(ret<-*arg2) MVX(*arg2<-*arg2) ST(*arg2<-arg0@X)
+strsep LD(ret<-*arg0) LDX(ret<-*arg0) MVX(*arg0<-*arg0)
+strpbrk ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+strncat ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) MV(*arg0<-*arg1@X) MV(*arg0@X<-*arg1@X)
+strlcpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@1) MV(*arg0<-*arg1@X) MV(*arg0@1<-*arg1) MV(*arg0@1<-*arg1@1) MV(*arg0@1<-*arg1@X) MV(*arg0@X<-*arg1) MV(*arg0@X<-*arg1@1) MV(*arg0@X<-*arg1@X)
+strcasestr ALIAS(ret<-arg0@X)
+strchr ALIAS(ret<-arg0@X)
+strcat ALIAS(ret<-arg0)
+twobyte_memmem ALIAS(ret<-arg0@X)
+threebyte_memmem ALIAS(ret<-arg0@X)
+fourbyte_memmem ALIAS(ret<-arg0@X)
+twoway_memmem ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+memchr ALIAS(ret<-arg0) ALIAS(ret<-arg0@1) ALIAS(ret<-arg0@X)
+memccpy ALIAS(ret<-arg0@1) ALIAS(ret<-arg0@2) ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@1) MV(*arg0<-*arg1@X) MV(*arg0@1<-*arg1) MV(*arg0@1<-*arg1@1) MV(*arg0@1<-*arg1@X) MV(*arg0@X<-*arg1) MV(*arg0@X<-*arg1@1) MV(*arg0@X<-*arg1@X)
+index ALIAS(ret<-arg0@X)
+shr MV(*arg0<-*arg0) MV(*arg0<-*arg0@8) MV(*arg0@8<-*arg0@8)
+shl MV(*arg0<-*arg0) MV(*arg0@8<-*arg0) MV(*arg0@8<-*arg0@8)
+llabs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+labs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+gcvt ALIAS(ret<-arg2)
+imaxabs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+atoll LD(ret<-*arg0@X)
+atol LD(ret<-*arg0@X)
+fmt_o ALIAS(ret<-arg1) ALIAS(ret<-arg1@X) ST(*arg1@X<-arg0@X)
+fmt_u ALIAS(ret<-arg1) ALIAS(ret<-arg1@X) ST(*arg1@X<-arg0@X)
+store_int ST(*arg0<-arg2)
+setvbuf MV(*arg0<-*arg0) ST(*arg0@88<-arg1@8) ST(*arg0@96<-arg3@X)
+setlinebuf MV(*arg0<-*arg0)
+setbuffer MV(*arg0<-*arg0) ST(*arg0@88<-arg1@8) ST(*arg0@96<-arg2@X)
+setbuf MV(*arg0<-*arg0) ST(*arg0@88<-arg1@8)
+combine_to_from ALIAS(ret<-arg0@X) ALIAS(ret<-arg1@X)
+extract_to ALIAS(ret<-arg0@X)
+extract_from ALIAS(ret<-arg0@X)
+wcsxfrm MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+vstrfmon_l ALIAS(ret<-arg0@X) MV(*arg0<-*arg3) MV(*arg0<-*arg3@X) MV(*arg0@1<-*arg3) MV(*arg0@1<-*arg3@X) MV(*arg0@X<-*arg3) MV(*arg0@X<-*arg3@X) MV(*arg4@4<-*arg4@4) MVX(*arg4@8<-*arg4@8)
+parseop ALIAS(ret<-arg1) ALIAS(ret<-arg1@1) ALIAS(ret<-arg1@2)
+binop MV(*arg0<-*arg0) ST(*arg0<-arg2@X)
+skipspace ALIAS(ret<-arg0@X)
+dummy ALIAS(ret<-arg0)
+count_syms_gnu LD(ret<-*arg0@X)
+aio_return LD(ret<-*arg0@120)
+fixup MV(*arg0<-*arg1@8) MV(*arg0@16<-*arg1@16) MV(*arg0@24<-*arg1@24) MV(*arg0@32<-*arg1@32) MV(*arg0@40<-*arg1@40) MV(*arg0@48<-*arg1@48) MV(*arg0@56<-*arg1@48) MV(*arg0@64<-*arg1@56) MV(*arg0@72<-*arg1@80) MV(*arg0@80<-*arg1@64) MV(*arg0@88<-*arg1) MV(*arg0@8<-*arg1@72) MV(*arg0@8<-*arg1@8)
+sigorset MV(*arg0@X<-*arg1@X) MV(*arg0@X<-*arg2@X)
+sigdelset MV(*arg0@X<-*arg0@X)
+sigandset MV(*arg0@X<-*arg1@X) MV(*arg0@X<-*arg2@X)
+sigaddset MV(*arg0@X<-*arg0@X)
+keyhash LD(ret<-*arg0@X)
+parse_dup_count ALIAS(ret<-arg0@X) MV(*arg1<-*arg0@X) MV(*arg1<-*arg1)
+tre_fill_pmatch MV(*arg1@X<-*arg4@X) ST(*arg1@X<-arg5)
+posix_spawnattr_setsigmask MV(*arg0@X<-*arg1@X)
+posix_spawnattr_setsigdefault MV(*arg0@X<-*arg1@X)
+posix_spawnattr_getsigdefault MV(*arg1@X<-*arg0@X)
+posix_spawnattr_getsigmask MV(*arg1@X<-*arg0@X)
+lcg64 ALIAS(ret<-arg0@X)
+itoa ALIAS(ret<-arg0) ALIAS(ret<-arg0@11) ALIAS(ret<-arg0@X)
+atou MVX(*arg0<-*arg0)
+ns_get32 LD(ret<-*arg0@X)
+ns_initparse ST(*arg2<-arg0) ST(*arg2<-arg0@X) ST(*arg2@8<-arg0@X) ST(*arg2@X<-arg0@X)
+ns_parserr MV(*arg0@68<-*arg0@68) MV(*arg0@72<-*arg0@X) MV(*arg3@1040<-*arg0@72) MV(*arg3@1040<-*arg0@X) MVX(*arg0@72<-*arg0@72) MVX(*arg0@72<-*arg0@X) MVX(*arg3@1040<-*arg0@72) MVX(*arg3@1040<-*arg0@X)
+inet_ntop ALIAS(ret<-arg2)
+ether_ntoa_r ALIAS(ret<-arg1) ALIAS(ret<-arg1@X)
+slash_len ALIAS(ret<-arg0@X)
+unescape_ent ALIAS(ret<-arg0) MV(*arg0<-*arg0@X) MV(*arg0@1<-*arg0@X) MV(*arg0@2<-*arg0@X) MV(*arg0@X<-*arg0@X)
+hasmntopt LD(ret<-*arg0@24) LDX(ret<-*arg0@24)
+permute MV(*arg0@X<-*arg0@X)
+getsubopt MV(*arg0<-*arg0) MVX(*arg0<-*arg0) MVX(*arg2<-*arg0)
+telldir LD(ret<-*arg0)
+ror ALIAS(ret<-arg0@X)
+get_meta LD(ret<-*arg0@X)
+get_nominal_size ALIAS(ret<-arg0@X) ALIAS(ret<-arg1@X)
+mul ST(*arg0<-arg2@X) ST(*arg0<-arg3@X) ST(*arg1<-arg2@X) ST(*arg1<-arg3@X)
+getoff MVX(*arg0<-*arg0)
+twoway_wcsstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+wcsspn ALIAS(ret<-arg0@X)
+wcsrchr ALIAS(ret<-arg0@X)
+wcsncat ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) MV(*arg0<-*arg1@X) MV(*arg0@X<-*arg1@X)
+wcscspn ALIAS(ret<-arg0@X)
+twoway_strstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+strnlen ALIAS(ret<-arg0@X) ALIAS(ret<-arg1)
+strrchr ALIAS(ret<-arg0@X)
+strlcat MV(*arg0@X<-*arg1) MV(*arg0@X<-*arg1@1) MV(*arg0@X<-*arg1@X)
+rindex ALIAS(ret<-arg0@X)
+memmem ALIAS(ret<-arg0) ALIAS(ret<-arg0@1) ALIAS(ret<-arg0@X)
+parse_dup ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) MV(*arg2<-*arg0@X) MV(*arg3<-*arg0@X)
+wcsstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+wcstok ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) LD(ret<-*arg2) LDX(ret<-*arg2) MVX(*arg2<-*arg2) ST(*arg2<-arg0@X)
+wcswcs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+wcspbrk ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+strstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+a_crash NOOP
+put_16 NOOP
+ccos NOOP
+killpg NOOP
+fp_barrier NOOP
+fp_force_eval NOOP
+nexttowardf NOOP
+y0 NOOP
+fmaxl NOOP
+llrintl NOOP
+pthread_mutexattr_getrobust NOOP
+wms_close NOOP
+posix_spawnattr_getschedparam NOOP
+ponef NOOP
+top12 NOOP
+malloc_atfork NOOP
+a_or NOOP
+setresgid NOOP
+a_store NOOP
+abs NOOP
+fp_force_evalf NOOP
+eval_as_double NOOP
+daemon NOOP
+endhostent NOOP
+zeroinfnan NOOP
+erfc1 NOOP
+nexttoward NOOP
+nexttowardl NOOP
+common NOOP
+rol NOOP
+a_cas NOOP
+pthread_condattr_destroy NOOP
+cacosh NOOP
+posix_spawnattr_getpgroup NOOP
+pthread_setcanceltype NOOP
+a_dec NOOP
+cfgetospeed NOOP
+cargl NOOP
+tanhl NOOP
+rint NOOP
+jnf NOOP
+set_size NOOP
+a_inc NOOP
+a_spin NOOP
+islower NOOP
+activate_group NOOP
+a_fetch_add NOOP
+lckpwdf NOOP
+dd_mul NOOP
+ns_name_uncompress NOOP
+seteuid NOOP
+atoi NOOP
+getoffs NOOP
+posix_openpt NOOP
+fp_force_evall NOOP
+ynf NOOP
+fminl NOOP
+quick_exit NOOP
+ispunct NOOP
+processblock NOOP
+record_seq NOOP
+cleanup NOOP
+pthread_getconcurrency NOOP
+creall NOOP
+catanhl NOOP
+casin NOOP
+catanhf NOOP
+pone NOOP
+ceil NOOP
+sha512_init NOOP
+sq NOOP
+addrcmp NOOP
+remainderf NOOP
+nearbyintl NOOP
+pzero NOOP
+fminf NOOP
+pthread_spin_unlock NOOP
+setregid NOOP
+clogf NOOP
+ether_line NOOP
+remainder NOOP
+fdiml NOOP
+sqrtf NOOP
+sigemptyset NOOP
+eval_as_float NOOP
+iswdigit NOOP
+upgradelock NOOP
+fabsl NOOP
+a_swap NOOP
+pthread_condattr_getclock NOOP
+atanhl NOOP
+is_leap NOOP
+brk NOOP
+ccoshl NOOP
+cacos NOOP
+tre_tag_order NOOP
+tgamma NOOP
+setgid NOOP
+endutxent NOOP
+j0 NOOP
+a_barrier NOOP
+conj NOOP
+log_inline NOOP
+qzero NOOP
+iswalnum NOOP
+remquol NOOP
+gettid NOOP
+isspace NOOP
+des_cipher NOOP
+match NOOP
+pthread_barrierattr_setpshared NOOP
+wmemcmp NOOP
+asinh NOOP
+iswpunct NOOP
+confstr NOOP
+getlogin_r NOOP
+swab NOOP
+setspent NOOP
+endspent NOOP
+inet_netof NOOP
+checkint NOOP
+copysignf NOOP
+init_file_lock NOOP
+csqrt NOOP
+csin NOOP
+posix_spawnattr_setschedparam NOOP
+mblen NOOP
+powf NOOP
+fmaf NOOP
+pthread_mutex_setprioceiling NOOP
+pthread_mutex_getprioceiling NOOP
+cprojl NOOP
+casinhf NOOP
+asin NOOP
+get_slot_index NOOP
+fabs NOOP
+tanf NOOP
+wcscoll NOOP
+tanhf NOOP
+specialcase NOOP
+BF_swap NOOP
+csqrtl NOOP
+csinhl NOOP
+tre_compare_lit NOOP
+temper NOOP
+getpid NOOP
+dummy_0 NOOP
+isupper NOOP
+allzerop NOOP
+if_freenameindex NOOP
+finitef NOOP
+account_bounce NOOP
+pthread_condattr_getpshared NOOP
+pthread_mutexattr_gettype NOOP
+ctanf NOOP
+S NOOP
+scalblnf NOOP
+dd_add NOOP
+asinf NOOP
+sinf NOOP
+legacy_map NOOP
+swapc NOOP
+qone NOOP
+coshf NOOP
+pthread_spin_destroy NOOP
+pthread_rwlockattr_setpshared NOOP
+pthread_barrierattr_destroy NOOP
+pzerof NOOP
+resetlock NOOP
+difftime NOOP
+nice NOOP
+csinf NOOP
+iswxdigit NOOP
+isalpha NOOP
+exp2 NOOP
+updwtmpx NOOP
+casefold NOOP
+nodtor NOOP
+cabs NOOP
+mkptr4 NOOP
+wcrtomb NOOP
+ilogb NOOP
+sinl NOOP
+pthread_attr_getschedpolicy NOOP
+aio_error NOOP
+exp2_inline NOOP
+acoshl NOOP
+fp_barrierf NOOP
+step_seq NOOP
+acoshf NOOP
+tan NOOP
+erfl NOOP
+towlower NOOP
+exp_inline NOOP
+cosl NOOP
+ctanhf NOOP
+getppid NOOP
+cpow NOOP
+sort NOOP
+lgammaf NOOP
+wcswidth NOOP
+BF_encrypt NOOP
+casinl NOOP
+sigisemptyset NOOP
+tre_stack_num_objects NOOP
+ulckpwdf NOOP
+dn_skipname NOOP
+nearbyintf NOOP
+logb NOOP
+floor NOOP
+isgraph NOOP
+is_bouncing NOOP
+sin NOOP
+exit NOOP
+posix_close NOOP
+jn NOOP
+size_to_class NOOP
+dummy1 NOOP
+ctan NOOP
+ctanl NOOP
+pthread_condattr_setpshared NOOP
+csqrtf NOOP
+lcg31 NOOP
+yn NOOP
+isdigit NOOP
+size_overflows NOOP
+pthread_attr_getschedparam NOOP
+rintf NOOP
+iswprint NOOP
+ascii_is_unsafe NOOP
+pthread_attr_setinheritsched NOOP
+setprotoent NOOP
+isxdigit NOOP
+pthread_attr_setscope NOOP
+sched_getparam NOOP
+R NOOP
+lrintl NOOP
+casinhl NOOP
+lgammal NOOP
+isastream NOOP
+ccosh NOOP
+logf NOOP
+cfgetispeed NOOP
+cmp NOOP
+ignore_err NOOP
+remquof NOOP
+atan2 NOOP
+iswblank NOOP
+get_32 NOOP
+conjf NOOP
+tre_stack_destroy NOOP
+a_clz_32 NOOP
+cacosl NOOP
+sync NOOP
+wcscasecmp_l NOOP
+put_32 NOOP
+c16rtomb NOOP
+nextafterl NOOP
+nearbyint NOOP
+ascii_to_bin NOOP
+sincosf NOOP
+cpowl NOOP
+qonef NOOP
+posix_spawnattr_destroy NOOP
+mbtowc NOOP
+trunc NOOP
+y0f NOOP
+setservent NOOP
+endprotoent NOOP
+sin_pi NOOP
+erfcf NOOP
+pthread_mutexattr_getprotocol NOOP
+carg NOOP
+posix_spawnattr_getschedpolicy NOOP
+setutxent NOOP
+cabsf NOOP
+grantpt NOOP
+scalbnl NOOP
+cbrtf NOOP
+log2 NOOP
+log1p NOOP
+alphasort NOOP
+getegid NOOP
+cfmakeraw NOOP
+top16 NOOP
+copysignl NOOP
+pthread_getcpuclockid NOOP
+inotify_init NOOP
+stub_dladdr NOOP
+res_init NOOP
+wcwidth NOOP
+getpagesize NOOP
+prefixmatch NOOP
+sethostent NOOP
+wctomb NOOP
+fmin NOOP
+BF_decode NOOP
+zi_read32 NOOP
+sem_destroy NOOP
+ccosl NOOP
+rintl NOOP
+fmodl NOOP
+clogl NOOP
+cabsl NOOP
+ilogbl NOOP
+sinhl NOOP
+y1 NOOP
+setresuid NOOP
+strverscmp NOOP
+strcasecmp NOOP
+iconv_close NOOP
+freelist NOOP
+erf NOOP
+getuid NOOP
+sem_trywait NOOP
+nextafterf NOOP
+remainderl NOOP
+pthread_spin_init NOOP
+fesetexceptflag NOOP
+round NOOP
+acos NOOP
+cproj NOOP
+sched_setscheduler NOOP
+setup_salt NOOP
+pthread_barrierattr_getpshared NOOP
+roundf NOOP
+iswlower NOOP
+catanl NOOP
+ether_ntohost NOOP
+iswspace NOOP
+sqrtl NOOP
+setuid NOOP
+pthread_attr_getinheritsched NOOP
+csinh NOOP
+atan NOOP
+fesetround NOOP
+endservent NOOP
+login_tty NOOP
+pthread_mutex_consistent NOOP
+cnd_destroy NOOP
+catanf NOOP
+scopeof NOOP
+erfc2 NOOP
+iswalpha NOOP
+fabsf NOOP
+sincosl NOOP
+sigfillset NOOP
+hexval NOOP
+ilogbf NOOP
+exp10 NOOP
+isblank NOOP
+catan NOOP
+toascii NOOP
+iswcntrl NOOP
+setpgrp NOOP
+cfsetspeed NOOP
+y1f NOOP
+getgid NOOP
+memcmp NOOP
+casinh NOOP
+j1f NOOP
+isalnum NOOP
+csinhf NOOP
+sigismember NOOP
+acosf NOOP
+geteuid NOOP
+cimagf NOOP
+mbsinit NOOP
+stirf NOOP
+pow NOOP
+cimagl NOOP
+wctob NOOP
+reducl NOOP
+modfl NOOP
+nanl NOOP
+nan NOOP
+qzerof NOOP
+cfsetospeed NOOP
+scalblnl NOOP
+asinhl NOOP
+pthread_attr_setschedparam NOOP
+fegetexceptflag NOOP
+posix_spawnattr_setflags NOOP
+ns_get16 NOOP
+ns_put32 NOOP
+fmod NOOP
+exp10f NOOP
+crealf NOOP
+log10 NOOP
+fmax NOOP
+setegid NOOP
+wcsncasecmp NOOP
+pthread_rwlock_destroy NOOP
+tre_stack_pop_int NOOP
+posix_spawnattr_setpgroup NOOP
+posix_spawnattr_getflags NOOP
+cosh NOOP
+uni_to_jis NOOP
+lgamma NOOP
+dirfd NOOP
+iswctype NOOP
+get_nprocs NOOP
+wcsncasecmp_l NOOP
+remquo NOOP
+copysign NOOP
+towupper NOOP
+str_next NOOP
+tcflow NOOP
+sched_setparam NOOP
+encrypt NOOP
+setreuid NOOP
+pthread_attr_destroy NOOP
+epoll_create NOOP
+posix_spawnattr_setschedpolicy NOOP
+log10f NOOP
+timer_handler NOOP
+strncasecmp NOOP
+bcmp NOOP
+ctanhl NOOP
+conjl NOOP
+log2_inline NOOP
+tss_delete NOOP
+pthread_mutexattr_destroy NOOP
+cimag NOOP
+ccoshf NOOP
+mkptr6 NOOP
+iswgraph NOOP
+strcoll NOOP
+cosf NOOP
+inet_lnaof NOOP
+atanh NOOP
+hypotl NOOP
+fuzzycmp NOOP
+log2f NOOP
+BF_set_key NOOP
+pthread_mutexattr_settype NOOP
+pthread_attr_setschedpolicy NOOP
+ms_close NOOP
+nanf NOOP
+logbl NOOP
+thrd_yield NOOP
+wcsncmp NOOP
+wcscmp NOOP
+dns_parse_callback NOOP
+cargf NOOP
+height NOOP
+regfree NOOP
+inet_makeaddr NOOP
+getlens NOOP
+decay_bounces NOOP
+sqrt NOOP
+pthread_rwlockattr_destroy NOOP
+erfcl NOOP
+atanhf NOOP
+cbrt NOOP
+week_num NOOP
+btowc NOOP
+versionsort NOOP
+mclose NOOP
+get_16 NOOP
+checkver NOOP
+rand NOOP
+j0f NOOP
+ldexpl NOOP
+fdimf NOOP
+isascii NOOP
+sincos NOOP
+cfsetispeed NOOP
+pthread_mutexattr_getpshared NOOP
+c32rtomb NOOP
+significandf NOOP
+floorf NOOP
+finite NOOP
+asinhf NOOP
+strxfrm NOOP
+catanh NOOP
+log1pf NOOP
+tcflush NOOP
+pthread_rwlockattr_getpshared NOOP
+is_lost_conn NOOP
+expm1f NOOP
+iscntrl NOOP
+get_nprocs_conf NOOP
+sem_getvalue NOOP
+expf NOOP
+cacoshl NOOP
+days_in_month NOOP
+pthread_mutexattr_setpshared NOOP
+tolower NOOP
+isprint NOOP
+md5_init NOOP
+wcscasecmp NOOP
+tanh NOOP
+scalbf NOOP
+fmaxf NOOP
+ctanh NOOP
+cpowf NOOP
+cacosf NOOP
+scalbn NOOP
+toupper NOOP
+exp NOOP
+cacoshf NOOP
+towctrans NOOP
+pthread_mutex_destroy NOOP
+tcsendbreak NOOP
+roundl NOOP
+ldexpf NOOP
+a_ctz_32 NOOP
+pthread_attr_getscope NOOP
+sched_getscheduler NOOP
+rand_r NOOP
+logbf NOOP
+tgammal NOOP
+a_and NOOP
+casinf NOOP
+tre_purge_regset NOOP
+sinh NOOP
+modff NOOP
+exp2f NOOP
+ns_put16 NOOP
+sinpi NOOP
+ceilf NOOP
+tre_neg_char_classes_match NOOP
+mtx_destroy NOOP
+acosh NOOP
+pthread_attr_getdetachstate NOOP
+cexpf NOOP
+tgammaf NOOP
+j1 NOOP
+pthread_setconcurrency NOOP
+cprojf NOOP
+scalbln NOOP
+modf NOOP
+atanf NOOP
+ns_skiprr NOOP
+cos NOOP
+getpgrp NOOP
+freeifaddrs NOOP
+ether_hostton NOOP
+exp10l NOOP
+cbrtl NOOP
+setkey NOOP
+pthread_condattr_setclock NOOP
+ccosf NOOP
+sinhf NOOP
+nextafter NOOP
+tanl NOOP
+significand NOOP
+log NOOP
+fdim NOOP
+closedir NOOP
+sha256_init NOOP
+sem_init NOOP
+cexpl NOOP
+scalb NOOP
+coshl NOOP
+iswupper NOOP
+creal NOOP
+cexp NOOP
+atan2f NOOP
+pthread_spin_trylock NOOP
+issetugid NOOP
+truncf NOOP
+erff NOOP
+erfc NOOP
+pthread_spin_lock NOOP
+csinl NOOP
+gethostid NOOP
+scalbnf NOOP
+expm1 NOOP
+BF_encode NOOP
+pthread_attr_setdetachstate NOOP
+in_set NOOP
+clog NOOP
+ldexp NOOP
+fmodf NOOP
+casemap NOOP
+
+# ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
+# apr_palloc carves from shared allocator blocks; FRESH on the leaf
+# dup/create family severs per-callsite object identity from the pool
+# blocks. APR source arg is arg1 (arg0 = pool). AUDIT RULE (learned
+# 2026-08-13 validation): a summary SKIPS the body, so NEVER summarize
+# a function whose body contains an indirect call — it starves.
+# REJECTED by that audit: apr_palloc + apr_psprintf/apr_pvsprintf
+# (pool->abort_fn dispatch in apr_palloc; psprintf_flush passed to
+# apr_vformatter inside apr_pvsprintf): measured -5 REAL pairs
+# (apr_palloc->abort_on_oom, apr_vformatter->psprintf_flush).
+# Entries below are audited dispatch-free bodies. A/B VERDICT
+# (2026-08-13, httpd HEAD FI): ANSWER-NEUTRAL (-0/+0 vs no-summary
+# base) — pool fusion does NOT drive httpd icall V-sets (ap_hook
+# channel territory); kept as audited-sound identity hygiene, same
+# policy as fwnode_connection_find_match. pstrcat is FRESH-only under
+# the declared text-serialization assumption (pointer cells do not
+# survive byte formatting).
+apr_pcalloc FRESH
+apr_pmemdup FRESH CPY(ret<-arg1)
+apr_pstrdup FRESH CPY(ret<-arg1)
+apr_pstrndup FRESH CPY(ret<-arg1)
+apr_pstrmemdup FRESH CPY(ret<-arg1)
+apr_pstrcat FRESH
+apr_bucket_alloc FRESH
+
+# ---- postgres memory contexts: WITHDRAWN (2026-08-13 validation) ----
+# The whole palloc/MemoryContextAlloc/repalloc/pstrdup family FAILS
+# the body-dispatch audit twice over: (1) every body reaches the
+# context->methods->{alloc,realloc} icall, so FRESH starved it —
+# measured repalloc 16->0 targets including the six REAL allocator
+# methods (AllocSetRealloc et al.), palloc-family 16->0 each, -474
+# pairs total, ALL unsound removals, zero precision value; (2) pg
+# recovers the owning context from a bit-packed CHUNK HEADER (pfree
+# -> GetMemoryChunkContext -> methods->free_p), so severing
+# caller-chunk/body-chunk identity breaks the free path in principle
+# (it survived only via unrelated smear). Re-adding needs (a) an
+# arg-preserving FRESH variant (wire actuals->formals, mint fresh
+# ret, drop body-ret binding) for hazard (1), and (b) explicit header
+# -channel modeling for hazard (2). Until both exist: NO pg entries.
+
+# ---- kernel: pair-correlated registration (task #28, INVOKE) ----
+# INVOKE(argF:fK<-argD): the fn at argF will be invoked with argD bound
+# to its formal K. Registration callsites bind (fn,data) directly and
+# the invocation edge is RE-ATTRIBUTED to the registration site
+# (Callees), so the pooled dispatcher container drains — this is the
+# modeling choice, precedent tp_func->__traceiter. Non-constant fn at a
+# callsite falls back to pooled wiring (LEDGERed); NULL fn is skipped.
+# ASSUMPTION (kthread FRESH): ret task_struct is a genuine per-call
+# allocation; fields templated inside copy_process are cut — scheduler
+# icalls keep targets via tasks from the pooled runqueue channels.
+kthread_create_on_node INVOKE(arg0:f0<-arg1) FRESH
+init_timer_key INVOKE(arg1:f0<-arg0)
+call_rcu INVOKE(arg1:f0<-arg0)
+call_rcu_hurry INVOKE(arg1:f0<-arg0)
+call_rcu_tasks INVOKE(arg1:f0<-arg0)
+call_rcu_tasks_trace INVOKE(arg1:f0<-arg0)
+call_rcu_tasks_rude INVOKE(arg1:f0<-arg0)
+call_srcu INVOKE(arg2:f0<-arg1)
+# irq_handler_t(int irq, void *dev_id): dev_id -> formal 1, both the
+# hardirq handler and the threaded fn receive the same dev_id
+request_threaded_irq INVOKE(arg1:f1<-arg5) INVOKE(arg2:f1<-arg5)
+
+# ---- kernel: tier-2 auto-confirmed INVOKE (2026-07-26, km A/B) ----
+# Emitted by --cfl-confirm-invoke under the completeness discipline
+# (DIRECT sync invocation / PASSTHRU composition), adopted after km
+# review: -397/+0 vs the INVOKE pin; smpboot_thread_fn left the pooled
+# smear and its own icalls sharpened 436 -> 101 pairs (true
+# smp_hotplug_thread population). See docs/cfl-graph-explosion-and-
+# scaling.md "Tier-2 confirmer".
+kthread_create_on_cpu INVOKE(arg0:f0<-arg1) FRESH
+request_any_context_irq INVOKE(arg1:f1<-arg4)
+__walk_iomem_res_desc INVOKE(arg5:f1<-arg4)
+walk_iomem_res_desc INVOKE(arg5:f1<-arg4)
+walk_system_ram_res INVOKE(arg3:f1<-arg2)
+walk_system_ram_res_rev INVOKE(arg3:f1<-arg2)
+walk_mem_res INVOKE(arg3:f1<-arg2)
+walk_system_ram_range INVOKE(arg3:f2<-arg2)
+hibernate_quiet_exec INVOKE(arg0:f0<-arg1)
+get_device_system_crosststamp INVOKE(arg0:f0<-arg3) INVOKE(arg0:f2<-arg1)
+kallsyms_on_each_symbol INVOKE(arg0:f0<-arg1)
+for_each_kernel_tracepoint INVOKE(arg0:f1<-arg1)
+bpf_dispatcher_nop_func INVOKE(arg2:f0<-arg0) INVOKE(arg2:f1<-arg1)
+
+# ---- kernel: tier-3 kerneldoc-mined INVOKE (2026-07-27, reviewed) ----
+# Source: --invoke-proposals mining (Qwopus3.6-27B over kerneldoc, 38
+# proposals) reviewed against 6.8.2 signatures/typedefs under the
+# completeness rule: adopt ONLY where every pointer the callback
+# receives is a caller formal (irq_handler_t(int,void*)=f1,
+# async_func_t(void*,cookie)=f0, cpu_stop_fn_t(void*)=f0,
+# smp_call_func_t(void*)=f0, task_call_f(p,void*)=f0/f1).
+# REJECTED in review (recorded so they aren't re-proposed):
+#   alarm_init (body installs alarmtimer_fired into the data formal's
+#     hrtimer — summarizing severs that channel), write_cache_pages /
+#     read_cache_folio / allocate_resource / free_ftrace_func_mapper /
+#     mempool_* (callback receives body-derived pointers our atom
+#     can't express), call_usermodehelper_setup / register_*sys_off /
+#     hw_breakpoint (callback receives a container/ret object, not the
+#     data arg), relay_open (ops-struct, family 3), raw_notifier_call_
+#     chain (dispatcher not registration; arg0 is the chain head),
+#     tracepoint_probe_register* (interacts with the static_call/tp
+#     model), dynevent_arg_add (cmd seq-buf ptr stores dropped).
+# smp_call_function_single: LLM proposed arg0<-arg1 (off-by-one vs
+# kerneldoc order); corrected to arg1<-arg2 in review.
+# devm irq pair: dev's devres bookkeeping loss is within the accepted
+# devres model (devres_alloc has been FRESH-summarized since the
+# isAllocFn era). __percpu dev_id binding matches the task #23
+# percpu identity model.
+__request_percpu_irq INVOKE(arg1:f1<-arg4)
+request_nmi INVOKE(arg1:f1<-arg4)
+request_percpu_nmi INVOKE(arg1:f1<-arg3)
+devm_request_threaded_irq INVOKE(arg2:f1<-arg6) INVOKE(arg3:f1<-arg6)
+devm_request_any_context_irq INVOKE(arg2:f1<-arg5)
+async_schedule_node INVOKE(arg0:f0<-arg1)
+async_schedule_node_domain INVOKE(arg0:f0<-arg1)
+async_schedule_dev_nocall INVOKE(arg0:f0<-arg1)
+stop_one_cpu INVOKE(arg1:f0<-arg2)
+stop_one_cpu_nowait INVOKE(arg1:f0<-arg2)
+stop_two_cpus INVOKE(arg2:f0<-arg3)
+stop_machine_from_inactive_cpu INVOKE(arg0:f0<-arg1)
+smp_call_function_single INVOKE(arg1:f0<-arg2)
+smp_call_function_any INVOKE(arg1:f0<-arg2)
+task_call_func INVOKE(arg1:f0<-arg0) INVOKE(arg1:f1<-arg2)
+
+# ---- kernel: keyed pair-channels — notifier chains (task #29) ----
+# CHAINREG(argK,*argB+OFF,fS): registration keyed by the chain-head
+# global at argK; callback read from the CONST INITIALIZER of the
+# block global at argB (byte OFF); block binds to callback formal fS.
+# CHAINCALL(argK:fN<-argV): dispatch keyed by argK; argV binds to each
+# registered callback's formal fN, and the callback becomes a callee
+# OF THE DISPATCH SITE. Pairs wired per key at finalize (static_call
+# precedent). Non-constant key/block/callback -> pooled fallback on
+# that side; keys with no in-corpus dispatch keep pooled registration
+# (nothing severed). Wrapper registrations (register_reboot_notifier
+# passing its formal) hit the block-dyn fallback -> pooled, sound.
+# notifier_fn_t(nb, action(long), data) -> f0=nb, f2=data; notifier_
+# call at offset 0 of notifier_block (verified 6.8.2).
+atomic_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+atomic_notifier_chain_register_unique_prio CHAINREG(arg0,*arg1+0,f0)
+blocking_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+blocking_notifier_chain_register_unique_prio CHAINREG(arg0,*arg1+0,f0)
+raw_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+srcu_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+atomic_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+blocking_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+raw_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+srcu_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+blocking_notifier_call_chain_robust CHAINCALL(arg0:f2<-arg3)
+raw_notifier_call_chain_robust CHAINCALL(arg0:f2<-arg3)
+
+# ---- kernel: dup family (FRESH + copy semantics) ----
+kmemdup FRESH CPY(ret<-arg0)
+kmemdup_nul FRESH CPY(ret<-arg0)
+kmemdup_array FRESH CPY(ret<-arg0)
+kstrdup FRESH CPY(ret<-arg0)
+kstrdup_const FRESH CPY(ret<-arg0)
+kstrndup FRESH CPY(ret<-arg0)
+kvmemdup FRESH CPY(ret<-arg0)
+krealloc FRESH CPY(ret<-arg0)
+__krealloc FRESH CPY(ret<-arg0)
+kvrealloc FRESH CPY(ret<-arg0)
+devm_kmemdup FRESH CPY(ret<-arg1)
+devm_krealloc FRESH CPY(ret<-arg1)
+# user-memory sources: no CPY by the uaccess assumption
+memdup_user FRESH
+vmemdup_user FRESH
+memdup_user_nul FRESH
+strndup_user FRESH
+
+# ---- kernel 6.10+ vintage: alloc_hooks renames (SummaryCheck decay
+# diff 2026-08-25, first cross-vintage use: these were live at 5.18,
+# dormant at 6.18). X() became a macro over X_noprof() (memory
+# allocation profiling); some moved behind __ prefixes. All verified
+# against linux-6.18.7 headers. Old names above stay for older
+# corpora — dormant entries are harmless by construction. Remaining
+# dormant set (raw spinlock family, consume_skb/kfree_skb_reason,
+# call_rcu_tasks, for_each_kernel_tracepoint) = config dormancy or
+# unverified renames — census material, not yet mirrored.
+kmemdup_noprof FRESH CPY(ret<-arg0)
+kmemdup_array_noprof FRESH CPY(ret<-arg0)
+kstrdup_noprof FRESH CPY(ret<-arg0)
+kstrdup_const_noprof FRESH CPY(ret<-arg0)
+kstrndup_noprof FRESH CPY(ret<-arg0)
+kvmemdup_noprof FRESH CPY(ret<-arg0)
+krealloc_noprof FRESH CPY(ret<-arg0)
+kvrealloc_noprof FRESH CPY(ret<-arg0)
+devm_kmemdup_noprof FRESH CPY(ret<-arg1)
+devm_krealloc_noprof FRESH CPY(ret<-arg1)
+memdup_user_noprof FRESH
+vmemdup_user_noprof FRESH
+__kvmalloc* FRESH
+alloc_pages_noprof FRESH
+alloc_pages_node_noprof FRESH
+alloc_pages_mpol_noprof FRESH
+get_free_pages_noprof FRESH
+pcpu_alloc_noprof FRESH
+vcalloc_noprof FRESH
+# timer API rename (init_timer_key -> timer_init_key, same shape:
+# fn at arg1 invoked with the timer at arg0 -> callback formal 0)
+timer_init_key INVOKE(arg1:f0<-arg0)
+
+# ---- kernel: slab/kmalloc families (legacy isAllocFn migration) ----
+# variable-length array forms were excluded in the legacy table
+kmalloc_array NONE
+kcalloc NONE
+kmalloc_array_node NONE
+kcalloc_node NONE
+krealloc_array NONE
+# glob-overreach exclusions (2026-08-11 census vs linux-5.18 defs):
+# lookups/helpers caught by the alloc globs — NOT allocators; FRESH
+# would fake a fresh return identity AND skip their bodies
+kmalloc_fix_flags NONE
+kmalloc_slab NONE
+kmalloc* FRESH
+__kmalloc* FRESH
+kzalloc* FRESH
+kmem_cache_alloc* FRESH
+kmem_cache_zalloc FRESH
+kvmalloc* FRESH
+kvzalloc* FRESH
+kvcalloc FRESH
+# glob-overreach exclusions for vmalloc*: init/lookup/query helpers
+vmalloc_init NONE
+vmalloc_to_page NONE
+vmalloc_to_pfn NONE
+vmalloc_dump_obj NONE
+vmalloc_nr_pages NONE
+vmalloc* FRESH
+vzalloc* FRESH
+__vmalloc* FRESH
+vcalloc FRESH
+
+# ---- kernel: managed / subsystem allocators (legacy migration) ----
+devm_kmalloc_release NONE
+devm_kmalloc* FRESH
+devm_kzalloc* FRESH
+alloc_dr FRESH
+__devres_alloc FRESH
+devres_alloc FRESH
+drmm_kmalloc* FRESH
+drmm_kzalloc* FRESH
+alloc_pages FRESH
+alloc_pages_node FRESH
+alloc_pages_mpol FRESH
+alloc_page FRESH
+alloc_page_vma FRESH
+__get_free_pages FRESH
+__get_free_page FRESH
+__get_dma_pages FRESH
+dma_alloc_attrs FRESH
+dma_alloc_coherent FRESH
+dma_alloc_noncoherent FRESH
+dma_alloc_wc FRESH
+dma_alloc_from_global_coherent FRESH
+# legacy: mempool_alloc and mempool_alloc_pages excluded
+mempool_alloc NONE
+mempool_alloc_pages NONE
+mempool_alloc_slab FRESH
+mempool_kmalloc FRESH
+bio_alloc FRESH
+bio_kmalloc FRESH
+bio_alloc_bioset FRESH
+sk_prot_alloc FRESH
+sk_alloc FRESH
+sock_kmalloc FRESH
+__netdev_alloc_skb FRESH
+__dev_alloc_page FRESH
+dev_alloc_page FRESH
+f2fs_kmalloc* FRESH
+f2fs_kzalloc* FRESH
+f2fs_kvmalloc* FRESH
+f2fs_kvzalloc* FRESH
+f2fs_kmem_cache_alloc FRESH
+bch2_trans_kmalloc FRESH
+__bch2_trans_kmalloc FRESH
+__ntfs_malloc FRESH
+bpf_map_kzalloc FRESH
+bpf_map_kvcalloc FRESH
+bpf_map_kmalloc FRESH
+kunit_kmalloc* FRESH
+kunit_kzalloc* FRESH
+kunit_kcalloc FRESH
+alloc_percpu FRESH
+__alloc_percpu FRESH
+__alloc_percpu_gfp FRESH
+__kfence_alloc FRESH
+kfence_alloc FRESH
+__kasan_kmalloc FRESH
+__kasan_slab_alloc FRESH
+kasan_kmalloc_large FRESH
+flexcop_device_kmalloc FRESH
+tasdevice_kzalloc FRESH
+jent_kvzalloc FRESH
+jent_zalloc FRESH
+uml_kmalloc FRESH
+
+# ---- kernel-scale confirmer adoptions (2026-07-28, option-b review) ----
+# Source: kernel chain-lift run (967618b): 20 DIRECT + 29 CHAINLIFT
+# confirmed under the completeness discipline at kernel scale;
+# adopted to keep the pinned config confirm-OFF (file = reviewed
+# artifact). Verdict: -8,221/+1 vs kernel-llm-invoke, additions and
+# drained dispatchers all vetted (see kernel-chain-stats.txt).
+acpi_ev_walk_gpe_list INVOKE(arg0:f2<-arg1)
+acpi_nvs_for_each_region INVOKE(arg0:f2<-arg1)
+acpi_reconfig_notifier_register CHAINREG(@acpi_reconfig_chain,*arg0+0,f0)
+arch_bpf_stack_walk INVOKE(arg0:f0<-arg1)
+arch_stack_walk_user INVOKE(arg0:f0<-arg1)
+backlight_register_notifier CHAINREG(@backlight_notifier,*arg0+0,f0)
+crypto_register_notifier CHAINREG(@crypto_chain,*arg0+0,f0)
+dmi_walk INVOKE(arg0:f1<-arg1)
+dm_target_iterate INVOKE(arg0:f1<-arg1)
+do_msgrcv INVOKE(arg5:f0<-arg1)
+dpm_for_each_dev INVOKE(arg1:f1<-arg0)
+efi_memattr_apply_permissions INVOKE(arg1:f0<-arg0)
+fb_register_client CHAINREG(@fb_notifier_list,*arg0+0,f0)
+for_each_thermal_cooling_device INVOKE(arg0:f1<-arg1)
+for_each_thermal_governor INVOKE(arg0:f1<-arg1)
+for_each_thermal_zone INVOKE(arg0:f1<-arg1)
+iosf_mbi_register_pmic_bus_access_notifier CHAINREG(@iosf_mbi_pmic_bus_access_notifier,*arg0+0,f0)
+iterate_supers INVOKE(arg0:f1<-arg1)
+lease_register_notifier CHAINREG(@lease_notifier_chain,*arg0+0,f0)
+mc146818_avoid_UIP INVOKE(arg0:f1<-arg2)
+mce_register_decode_chain CHAINREG(@x86_mce_decoder_chain,*arg0+0,f0)
+napi_busy_loop INVOKE(arg1:f0<-arg2)
+netlink_register_notifier CHAINREG(@netlink_chain,*arg0+0,f0)
+nvmem_register_notifier CHAINREG(@nvmem_notifier,*arg0+0,f0)
+open_related_ns INVOKE(arg1:f0<-arg0)
+power_supply_reg_notifier CHAINREG(@power_supply_notifier,*arg0+0,f0)
+pvclock_gtod_register_notifier CHAINREG(@pvclock_gtod_chain,*arg0+0,f0)
+register_acpi_notifier CHAINREG(@acpi_chain_head,*arg0+0,f0)
+register_inet6addr_notifier CHAINREG(@inet6addr_chain,*arg0+0,f0)
+register_inet6addr_validator_notifier CHAINREG(@inet6addr_validator_chain,*arg0+0,f0)
+register_inetaddr_notifier CHAINREG(@inetaddr_chain,*arg0+0,f0)
+register_inetaddr_validator_notifier CHAINREG(@inetaddr_validator_chain,*arg0+0,f0)
+register_keyboard_notifier CHAINREG(@keyboard_notifier_list,*arg0+0,f0)
+register_memory_notifier CHAINREG(@memory_chain,*arg0+0,f0)
+register_module_notifier CHAINREG(@module_notify_list,*arg0+0,f0)
+register_mt_adistance_algorithm CHAINREG(@mt_adistance_algorithms,*arg0+0,f0)
+register_netevent_notifier CHAINREG(@netevent_notif_chain,*arg0+0,f0)
+register_oom_notifier CHAINREG(@oom_notify_list,*arg0+0,f0)
+register_pm_notifier CHAINREG(@pm_chain_head,*arg0+0,f0)
+register_reboot_notifier CHAINREG(@reboot_notifier_list,*arg0+0,f0)
+register_restart_handler CHAINREG(@restart_handler_list,*arg0+0,f0)
+register_switchdev_blocking_notifier CHAINREG(@switchdev_blocking_notif_chain,*arg0+0,f0)
+register_switchdev_notifier CHAINREG(@switchdev_notif_chain,*arg0+0,f0)
+register_vmap_purge_notifier CHAINREG(@vmap_notify_list,*arg0+0,f0)
+register_vt_notifier CHAINREG(@vt_notifier_list,*arg0+0,f0)
+skx_pmu_get_topology INVOKE(arg1:f0<-arg0)
+vc_t416_color INVOKE(arg2:f0<-arg0)
+walk_dynamic_memory_groups INVOKE(arg1:f1<-arg3)
+walk_memory_blocks INVOKE(arg3:f1<-arg2)
+
+# ---- task #30: ops-pairs ST proposals (auto-proposed by --cfl-propose-ops-st,
+# ---- reviewed 2026-07-29 against kernel/bpf/syscall.c) ----
+# bpf_link_init(link, type, ops, prog): pure setter — refcnt/type/id are
+# scalars; the two pointer stores are the (ops, prog) registration pair.
+# Per-callsite ST severs the pooled link formal so each caller's link
+# object keeps its own (ops, prog) identity.
+bpf_link_init ST(*arg0<-arg2) ST(*arg0<-arg3)
+# d_set_d_op(dentry, op): the dentry_operations registration channel
+# (fs/dcache.c). One pointer store dentry->d_op = op; the rest is
+# d_flags scalar bit-ORs and null-check probes of op's members.
+d_set_d_op ST(*arg0<-arg1)
+
+# ---- task #31: ret-pooling HOF family (fwnode devcon) ----
+# Verified against drivers/base/property.c (6.8): every non-NULL
+# return of fwnode_connection_find_match IS a match-callback return
+# (the static helpers store match(node,...) into the out slot; count
+# guards NULL). PURE-RET form on purpose: the callback's formal 0
+# receives graph-walk nodes the caller never passes, so args stay
+# pooled (no completeness claim); constant-fn callsites bind ret
+# per-callsite. NOTE (kernel A/B 2026-07-31): NO-OP on the current
+# bclist corpus — zero callers built (usb/typec, usb/roles absent);
+# the 9,767x ProtWriters exemplar was a mega-class MEMBER name, not a
+# causal channel (attribution lesson recorded in the scaling doc).
+# Kept: reviewed, sound, and live on fuller corpora.
+# fwnode_connection_find_matches (plural) fills a caller ARRAY and
+# returns a count — deref-binding shape, NOT covered; stays pooled.
+fwnode_connection_find_match INVOKE(arg3:ret)
+
+# ---- NOOP: no transfer at the callsite, body skipped ----
+# Migrated 2026-08-07 (task #44 follow-up) from the hardcoded
+# isFreeFn/isKernelUtilityFn lists in Annotation.cc. When this file is
+# loaded it is AUTHORITATIVE: the hardcoded lists are not consulted.
+# NOOP is standalone (no other atoms on the line). EXACT names only —
+# the lockdep_/lock_/rcu_ prefix skip silently dropped whole function
+# bodies (l_show/lc_show FN, task #44); a prefix here must carry the
+# same audit burden as everywhere else.
+# free family (end-of-life: argument flows nowhere we model)
+free NOOP
+cfree NOOP
+_ZdlPv* NOOP
+_ZdaPv* NOOP
+kfree NOOP
+kfree_sensitive NOOP
+kzfree NOOP
+kvfree NOOP
+vfree NOOP
+vfree_atomic NOOP
+kmem_cache_free NOOP
+devm_kfree NOOP
+drmm_kfree NOOP
+__free_pages NOOP
+free_pages NOOP
+free_page NOOP
+put_page NOOP
+__free_page NOOP
+dma_free_coherent NOOP
+dma_free_attrs NOOP
+dma_free_noncoherent NOOP
+dma_free_wc NOOP
+mempool_free NOOP
+bio_put NOOP
+bio_free NOOP
+sock_kfree_s NOOP
+kfree_skb NOOP
+__kfree_skb NOOP
+consume_skb NOOP
+kfree_skb_reason NOOP
+__kfree_skb_defer NOOP
+dev_kfree_skb NOOP
+dev_kfree_skb_any NOOP
+dev_kfree_skb_irq NOOP
+free_percpu NOOP
+kunit_kfree NOOP
+f2fs_kfree* NOOP
+f2fs_kvfree* NOOP
+bpf_map_kfree NOOP
+bpf_map_kvfree NOOP
+jent_zfree NOOP
+jent_kvzfree NOOP
+kfree_const NOOP
+kfree_rcu NOOP
+kvfree_rcu NOOP
+# print/debug sinks (vararg byte formatting, no pointer transfer)
+_printk NOOP
+printk NOOP
+__warn_printk NOOP
+seq_printf NOOP
+# out-of-line lock entry points (closed set, kernel/locking)
+mutex_lock NOOP
+mutex_unlock NOOP
+mutex_lock_nested NOOP
+spin_lock NOOP
+spin_unlock NOOP
+_raw_spin_lock NOOP
+_raw_spin_unlock NOOP
+_raw_spin_lock_irq NOOP
+_raw_spin_unlock_irq NOOP
+_raw_spin_lock_irqsave NOOP
+_raw_spin_lock_irqsave_nested NOOP
+_raw_spin_unlock_irqrestore NOOP
+_raw_spin_lock_bh NOOP
+_raw_spin_unlock_bh NOOP
+_raw_spin_trylock NOOP
+_raw_spin_trylock_bh NOOP
+_raw_read_lock NOOP
+_raw_read_unlock NOOP
+_raw_read_lock_irq NOOP
+_raw_read_unlock_irq NOOP
+_raw_read_lock_irqsave NOOP
+_raw_read_unlock_irqrestore NOOP
+_raw_read_lock_bh NOOP
+_raw_read_unlock_bh NOOP
+_raw_read_trylock NOOP
+_raw_write_lock NOOP
+_raw_write_unlock NOOP
+_raw_write_lock_irq NOOP
+_raw_write_unlock_irq NOOP
+_raw_write_lock_irqsave NOOP
+_raw_write_unlock_irqrestore NOOP
+_raw_write_lock_bh NOOP
+_raw_write_unlock_bh NOOP
+_raw_write_trylock NOOP
+_raw_write_lock_nested NOOP
+# lockdep/rcu validation entry points (exact, audited)
+lock_acquire NOOP
+lock_release NOOP
+lock_is_held_type NOOP
+rcu_read_lock NOOP
+rcu_read_unlock NOOP
+rcu_read_lock_held NOOP
+rcu_is_watching NOOP
+lockdep_hardirqs_on NOOP
+lockdep_hardirqs_off NOOP
+lockdep_init_map_type NOOP
+# string utilities (byte data, high fan-out)
+strlen NOOP
+strcmp NOOP
+strncmp NOOP
+strcpy NOOP
+strncpy NOOP
+
+# ---- userland extern boundary (task #45 census, libpng exemplar) ----
+# __cxa_throw(obj, tinfo, dtor): the Itanium ABI invokes dtor(obj)
+# during unwind — the only fn-ptr-carrying extern at the libpng
+# boundary (--cfl-census-extern-bound). Kernel census verdict: the
+# kernel corpus boundary is CLOSED for pointer flows (6 residual
+# externs = kernel/bpf/verifier.o missing from bclist, 0 fn-ptr args;
+# memcpy family enters IR as llvm.memcpy intrinsics, modeled).
+__cxa_throw INVOKE(arg2:f0<-arg0)
+# __dynamic_cast(obj, src_tinfo, dst_tinfo, hint): the Itanium ABI
+# returns null or a pointer into obj's own complete object -- offset 0
+# for a same-subobject cast, another offset (possibly negative) for a
+# cast across a secondary base. Unmodeled, its result was a synthetic
+# root with no content: every virtual call on a dynamic_cast result
+# resolved to NOTHING (SoK mp42aac: 21 of 168 fuzz-observed targets
+# missed at 19 sites; with this entry 168/168, 2026-09-27).
+__dynamic_cast ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+
+# --- printf/str leaf block (2026-08-19, junction-dissolution campaign) ---
+# Hand-audited chain bottoms for the NoopProp prover (they refuse
+# mechanically for reasons a human clears by contract):
+# - printf family: writes CHARS through the caller buffer; %p renders
+#   pointers as TEXT — no pointer value is stored retrievably. Bodies
+#   contain no indirect calls (format handlers are direct dispatch).
+# - strcspn: ret-launder refusal = pointer-subtraction count; a length
+#   is not an address by contract.
+# - dump_stack: diagnostics-only (unwinder prints; transfers nothing).
+vsnprintf NOOP
+vsprintf NOOP
+snprintf NOOP
+sprintf NOOP
+scnprintf NOOP
+vscnprintf NOOP
+strcspn NOOP
+dump_stack NOOP
+# printk ring core (hand audit 2026-08-21): vprintk_store formats
+# fmt/args to TEXT via printk_sprint/vsnprintf into the ring record,
+# memcpys dev_printk_info (char subsystem[16]/device[48] — no
+# pointers) into the record, manages prb descriptors (int atomics).
+# No fn-pointer storage; ret = printed length (count). No in-body
+# icalls (console dispatch lives in console_unlock, NOT here).
+# Body-skip loses only ring TEXT stores + prb calls whose content is
+# char/int — nothing fn-ptr-relevant transits the printk ring (console
+# write callbacks receive (con, text, len); devkmsg reads text).
+# Provers bottom here: memcpy-of-formal-cells (untyped) + prb cmpxchg
+# asm — same audit class as vsnprintf.
+vprintk_store NOOP
+# uaccess copy core (hand audit 2026-08-21, backed by the user-copy
+# certificate work --cfl-cert-user-copy): _copy_from_user writes
+# USER-CONTROLLED bytes into the kernel buffer — user memory cannot
+# supply valid in-kernel fn-pointer identity (the certified user-copy
+# thesis); _copy_to_user moves kernel bytes OUT to user space — no
+# in-kernel flow is created. Neither transfers fn-ptr identity
+# between kernel objects; rets are copied-byte counts. Provers bottom
+# on the uaccess asm bodies.
+_copy_from_user NOOP
+_copy_to_user NOOP
+# sysctl generic proc handlers (hand audit 2026-08-24; rendezvous-
+# keying campaign, Gate-0 top weld: every subsystem's static ctl_table
+# flowing into these formals welded 56 subsystems at km). Each handler
+# below moves SCALARS only: int/uint/u8/ulong/bool/jiffies/string
+# bytes between the user buffer (certified, see _copy_*_user above)
+# and table->data, plus *lenp/*ppos counts; extra1/extra2 reads are
+# bound ints. NO pointer is stored through any formal. EMPTY (not
+# NOOP): bodies stay walked so __do_proc_dointvec's conv icall — a
+# REAL dispatch to the file-local conv constants wired at the internal
+# DIRECT callsites — keeps resolving; only callsite wiring is cut,
+# including at the indirectly-resolved proc_sys dispatch
+# (transfer-free summaries apply at icall sites — handleCall). NOT
+# summarized on purpose: proc_do_large_bitmap (temp-bitmap alloc,
+# separate audit), proc_do_static_key (jump-label side effects),
+# every subsystem-custom handler (per-subsystem pooling is correct
+# granularity there).
+proc_dostring EMPTY
+proc_dobool EMPTY
+proc_dointvec EMPTY
+proc_dointvec_minmax EMPTY
+proc_douintvec EMPTY
+proc_douintvec_minmax EMPTY
+proc_dou8vec_minmax EMPTY
+proc_dointvec_jiffies EMPTY
+proc_dointvec_ms_jiffies EMPTY
+proc_dointvec_userhz_jiffies EMPTY
+proc_dointvec_ms_jiffies_minmax EMPTY
+proc_doulongvec_minmax EMPTY
+proc_doulongvec_ms_jiffies_minmax EMPTY
+# Driver-core probe channel PILOT (hand model 2026-08-22, user-approved
+# explicit modeling of hard kernel fns): the (driver, device) pairing
+# is keyed by the BUS TYPE global — registration wrappers hardcode it,
+# device-add wrappers dispatch on it. CHAINREG reads the driver
+# struct's constant initializer (probe/remove members at 5.18 x86-64
+# byte offsets); CHAINCALL binds the device to the callback's formal 0
+# and attributes the pairs at the wrapper callsite (REGCALL). The
+# registration summary owning its callsite severs driver structs from
+# pooling into the bus machinery (drains really_probe's icall);
+# dispatch sites keep pooled wiring (fallback regs stay sound).
+# pci_driver: node(16) name(8) id_table(8) probe@32 remove@40; probe's
+# f1 = id-table entry (block interior) — block->f1 binding; remove has
+# no block formal -> f9 (out-of-range = no self bind).
+__pci_register_driver CHAINREG(@pci_bus_type,*arg0+32,f1) CHAINREG(@pci_bus_type,*arg0+40,f9)
+pci_device_add CHAINCALL(@pci_bus_type:f0<-arg0)
+# platform_driver: probe@0 remove@8
+__platform_driver_register CHAINREG(@platform_bus_type,*arg0+0,f9) CHAINREG(@platform_bus_type,*arg0+8,f9)
+platform_device_add CHAINCALL(@platform_bus_type:f0<-arg0)
+
+# ---- bfd / libiberty callback dispatchers: per-site pairing (2026-09-17) ----
+# bfd_hash_table.table @0 = bucket array of entry pointers (every entry is stored into it);
+# htab.entries @24 = slot array (the callback receives a slot address). bfd_map_over_sections
+# walks a `next`-linked list, which one reference cannot express soundly: clone it per caller.
+bfd_hash_traverse DISPATCH(arg1:f0<-**arg0@0) DISPATCH(arg1:f1<-arg2)
+bfd_link_hash_traverse DISPATCH(arg1:f0<-**arg0@0) DISPATCH(arg1:f1<-arg2)
+htab_traverse_noresize DISPATCH(arg1:f0<-*arg0@24) DISPATCH(arg1:f1<-arg2)
+htab_traverse DISPATCH(arg1:f0<-*arg0@24@htab_traverse_noresize) DISPATCH(arg1:f1<-arg2@htab_traverse_noresize)

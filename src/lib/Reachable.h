@@ -1,0 +1,64 @@
+#ifndef _REACHABLE_CALL_GRAPH_H
+#define _REACHABLE_CALL_GRAPH_H
+
+#include <llvm/IR/Value.h>
+
+#include <deque>
+#include <limits>
+#include <unordered_set>
+#include <unordered_map>
+#include <vector>
+
+#include "Global.h"
+
+class ReachableCallGraphPass {
+private:
+  llvm::Function *getFuncDef(llvm::Function*);
+  bool runOnFunction(llvm::Function*);
+  bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
+  bool findCalleesByType(llvm::CallBase*, FuncSet&);
+  std::string getSourceLocation(const llvm::BasicBlock *BB);
+
+  GlobalContext *Ctx;
+
+  CalleeMap calleeByType;
+  CallerMap callerByType;
+
+  const bool UseTypeBasedCallGraph;
+  const bool PropagateThroughReturnEdgees;
+
+  std::unordered_map<const llvm::BasicBlock*, uint64_t> BBIDs;
+  uint64_t nextBBID;
+
+  std::vector<std::pair<std::string, int> > targetList;
+  std::vector<std::string> entryList;
+  std::unordered_set<const llvm::BasicBlock*> reachableBBs;
+  std::unordered_map<const llvm::BasicBlock*, double> distances;
+  std::unordered_set<const llvm::BasicBlock*> exitBBs;
+  std::unordered_set<const llvm::BasicBlock*> entryBBs;
+  using CallSequence = std::vector<const llvm::CallBase*>;
+  std::unordered_map<const llvm::BasicBlock*, CallSequence> BBswithCalls;
+  std::unordered_map<const llvm::CallBase*, double> callDistances;
+  std::unordered_set<const llvm::CallBase*> reachableIndirectCalls;
+
+public:
+    ReachableCallGraphPass(GlobalContext *Ctx_, std::string &TargetList,
+        std::string &EntryList, bool typeBased = true, bool propagateRet = false);
+    virtual bool doInitialization(llvm::Module *);
+    virtual bool doFinalization(llvm::Module *);
+    virtual void run(ModuleList &modules);
+
+    // simple bfs pass
+    void collectReachable(std::deque<const BasicBlock*> &worklist,
+        std::unordered_set<const BasicBlock*> &reachable);
+
+    // debug
+    void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
+    void dumpPolicy(std::ostream &OS);
+    void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
+    bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
+    void dumpCallees();
+    void dumpCallers();
+};
+
+#endif
